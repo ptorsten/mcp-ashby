@@ -7,6 +7,8 @@
 # ///
 import asyncio
 import json
+import logging
+import sys
 from typing import Any, Optional
 import os
 from dotenv import load_dotenv
@@ -16,6 +18,14 @@ import mcp.types as types
 from mcp.server import Server, NotificationOptions
 from mcp.server.models import InitializationOptions
 import mcp.server.stdio
+
+# Log to stderr — stdout is reserved for the MCP JSON-RPC transport.
+logging.basicConfig(
+    level=os.getenv("ASHBY_MCP_LOG_LEVEL", "INFO"),
+    stream=sys.stderr,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("ashby-mcp")
 
 class AshbyClient:
     """Handles Ashby operations and caching."""
@@ -37,12 +47,12 @@ class AshbyClient:
                 raise ValueError("ASHBY_API_KEY environment variable not set")
             
             self.headers = {
-                "Authorization": f"Basic {self.api_key}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "Accept": "application/json",
             }
             return True
         except Exception as e:
-            print(f"Ashby connection failed: {str(e)}")
+            logger.error("Ashby connection failed: %s", e)
             return False
 
     def _make_request(self, endpoint: str, method: str = "GET", data: Optional[dict] = None) -> dict:
@@ -60,12 +70,24 @@ class AshbyClient:
             raise ValueError("Ashby connection not established")
             
         url = f"{self.base_url}{endpoint}"
+        logger.debug("Ashby API request: %s %s", method, endpoint)
         response = requests.request(
             method=method,
             url=url,
             headers=self.headers,
-            json=data
+            json=data,
+            auth=(self.api_key, ""),
         )
+        if response.status_code in (401, 403):
+            logger.warning(
+                "Ashby API auth failure: %s %s -> %s",
+                method, endpoint, response.status_code,
+            )
+        elif response.status_code >= 400:
+            logger.error(
+                "Ashby API error: %s %s -> %s",
+                method, endpoint, response.status_code,
+            )
         response.raise_for_status()
         return response.json()
 
@@ -78,7 +100,7 @@ load_dotenv()
 # Configure with Ashby API key from environment variables
 ashby_client = AshbyClient()
 if not ashby_client.connect():
-    print("Failed to initialize Ashby connection")
+    logger.error("Failed to initialize Ashby connection")
 
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
@@ -219,6 +241,90 @@ async def handle_list_tools() -> list[types.Tool]:
             }
         ),
         
+        # Interview Feedback / Scorecard Tools
+        types.Tool(
+            name="list_feedback",
+            description="List all feedback (scorecards) submitted for an application",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "applicationId": {"type": "string", "description": "The id of the application to fetch feedback for"},
+                    "cursor": {"type": "string", "description": "Pagination cursor"},
+                    "syncToken": {"type": "string", "description": "Sync token for incremental updates"},
+                    "limit": {"type": "integer", "description": "Max results per page"}
+                },
+                "required": ["applicationId"]
+            }
+        ),
+        types.Tool(
+            name="submit_feedback",
+            description=(
+                "Submit interview feedback (scorecard) for an application. "
+                "Use get_feedback_form first to discover field paths and types — "
+                "feedbackForm.fieldSubmissions entries reference those paths."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "applicationId": {"type": "string", "description": "The application receiving the feedback"},
+                    "formDefinitionId": {"type": "string", "description": "Id of the feedback form definition being submitted"},
+                    "feedbackForm": {
+                        "type": "object",
+                        "description": (
+                            "The submitted form, typically shaped as "
+                            "{ fieldSubmissions: [{ path, value }, ...] }. "
+                            "Value shape depends on field type — e.g. Score: {score: 1-4}, "
+                            "RichText: {type: 'PlainText', value: '...'}."
+                        )
+                    },
+                    "userId": {"type": "string", "description": "Credit feedback to this user. Defaults to the API key's user."},
+                    "interviewEventId": {"type": "string", "description": "The interview event this feedback is for (required when scoped to a specific interview)."}
+                },
+                "required": ["applicationId", "formDefinitionId", "feedbackForm"]
+            }
+        ),
+        types.Tool(
+            name="list_feedback_forms",
+            description="List all feedback form definitions (scorecard templates)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "includeArchived": {"type": "boolean", "description": "Include archived forms"},
+                    "cursor": {"type": "string", "description": "Pagination cursor"},
+                    "syncToken": {"type": "string", "description": "Sync token for incremental updates"},
+                    "limit": {"type": "integer", "description": "Max results per page"}
+                }
+            }
+        ),
+        types.Tool(
+            name="get_feedback_form",
+            description="Get a single feedback form definition by id — use to discover field paths/types before submit_feedback",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "feedbackFormDefinitionId": {"type": "string", "description": "The id of the feedback form to fetch"}
+                },
+                "required": ["feedbackFormDefinitionId"]
+            }
+        ),
+
+        # Candidate Notes (read-only)
+        types.Tool(
+            name="list_candidate_notes",
+            description="List all notes on a candidate",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "candidateId": {"type": "string", "description": "The id of the candidate to fetch notes for"},
+                    "includeArchived": {"type": "boolean", "description": "Include archived notes"},
+                    "cursor": {"type": "string", "description": "Pagination cursor"},
+                    "syncToken": {"type": "string", "description": "Sync token for incremental updates"},
+                    "limit": {"type": "integer", "description": "Max results per page"}
+                },
+                "required": ["candidateId"]
+            }
+        ),
+
         # Analytics Tools
         types.Tool(
             name="get_pipeline_metrics",
@@ -318,7 +424,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
                 method="POST",
                 data=arguments
             )
-            return [types.TextContent(text=f"Created candidate: {json.dumps(response, indent=2)}")]
+            return [types.TextContent(type="text", text=f"Created candidate: {json.dumps(response, indent=2)}")]
             
         elif name == "search_candidates":
             response = ashby_client._make_request(
@@ -326,7 +432,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
                 method="POST",
                 data=arguments
             )
-            return [types.TextContent(text=f"Search results: {json.dumps(response, indent=2)}")]
+            return [types.TextContent(type="text", text=f"Search results: {json.dumps(response, indent=2)}")]
             
         elif name == "list_candidates":
             response = ashby_client._make_request(
@@ -334,7 +440,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
                 method="POST",
                 data=arguments
             )
-            return [types.TextContent(text=f"Candidate list: {json.dumps(response, indent=2)}")]
+            return [types.TextContent(type="text", text=f"Candidate list: {json.dumps(response, indent=2)}")]
             
         elif name == "create_job":
             response = ashby_client._make_request(
@@ -342,7 +448,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
                 method="POST",
                 data=arguments
             )
-            return [types.TextContent(text=f"Created job: {json.dumps(response, indent=2)}")]
+            return [types.TextContent(type="text", text=f"Created job: {json.dumps(response, indent=2)}")]
             
         elif name == "search_jobs":
             response = ashby_client._make_request(
@@ -350,7 +456,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
                 method="POST",
                 data=arguments
             )
-            return [types.TextContent(text=f"Job search results: {json.dumps(response, indent=2)}")]
+            return [types.TextContent(type="text", text=f"Job search results: {json.dumps(response, indent=2)}")]
             
         elif name == "create_application":
             response = ashby_client._make_request(
@@ -358,7 +464,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
                 method="POST",
                 data=arguments
             )
-            return [types.TextContent(text=f"Created application: {json.dumps(response, indent=2)}")]
+            return [types.TextContent(type="text", text=f"Created application: {json.dumps(response, indent=2)}")]
             
         elif name == "list_applications":
             response = ashby_client._make_request(
@@ -366,7 +472,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
                 method="POST",
                 data=arguments
             )
-            return [types.TextContent(text=f"Application list: {json.dumps(response, indent=2)}")]
+            return [types.TextContent(type="text", text=f"Application list: {json.dumps(response, indent=2)}")]
             
         elif name == "create_interview":
             response = ashby_client._make_request(
@@ -374,7 +480,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
                 method="POST",
                 data=arguments
             )
-            return [types.TextContent(text=f"Created interview: {json.dumps(response, indent=2)}")]
+            return [types.TextContent(type="text", text=f"Created interview: {json.dumps(response, indent=2)}")]
             
         elif name == "list_interviews":
             response = ashby_client._make_request(
@@ -382,15 +488,55 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
                 method="POST",
                 data=arguments
             )
-            return [types.TextContent(text=f"Interview list: {json.dumps(response, indent=2)}")]
+            return [types.TextContent(type="text", text=f"Interview list: {json.dumps(response, indent=2)}")]
             
+        elif name == "list_feedback":
+            response = ashby_client._make_request(
+                "/applicationFeedback.list",
+                method="POST",
+                data=arguments
+            )
+            return [types.TextContent(type="text", text=f"Feedback list: {json.dumps(response, indent=2)}")]
+
+        elif name == "submit_feedback":
+            response = ashby_client._make_request(
+                "/applicationFeedback.submit",
+                method="POST",
+                data=arguments
+            )
+            return [types.TextContent(type="text", text=f"Submitted feedback: {json.dumps(response, indent=2)}")]
+
+        elif name == "list_feedback_forms":
+            response = ashby_client._make_request(
+                "/feedbackFormDefinition.list",
+                method="POST",
+                data=arguments
+            )
+            return [types.TextContent(type="text", text=f"Feedback forms: {json.dumps(response, indent=2)}")]
+
+        elif name == "get_feedback_form":
+            response = ashby_client._make_request(
+                "/feedbackFormDefinition.info",
+                method="POST",
+                data=arguments
+            )
+            return [types.TextContent(type="text", text=f"Feedback form: {json.dumps(response, indent=2)}")]
+
+        elif name == "list_candidate_notes":
+            response = ashby_client._make_request(
+                "/candidate.listNotes",
+                method="POST",
+                data=arguments
+            )
+            return [types.TextContent(type="text", text=f"Candidate notes: {json.dumps(response, indent=2)}")]
+
         elif name == "get_pipeline_metrics":
             response = ashby_client._make_request(
                 "/analytics.pipeline",
                 method="POST",
                 data=arguments
             )
-            return [types.TextContent(text=f"Pipeline metrics: {json.dumps(response, indent=2)}")]
+            return [types.TextContent(type="text", text=f"Pipeline metrics: {json.dumps(response, indent=2)}")]
             
         elif name == "bulk_create_candidates":
             response = ashby_client._make_request(
@@ -398,7 +544,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
                 method="POST",
                 data=arguments
             )
-            return [types.TextContent(text=f"Bulk create results: {json.dumps(response, indent=2)}")]
+            return [types.TextContent(type="text", text=f"Bulk create results: {json.dumps(response, indent=2)}")]
             
         elif name == "bulk_update_applications":
             response = ashby_client._make_request(
@@ -406,7 +552,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
                 method="POST",
                 data=arguments
             )
-            return [types.TextContent(text=f"Bulk update results: {json.dumps(response, indent=2)}")]
+            return [types.TextContent(type="text", text=f"Bulk update results: {json.dumps(response, indent=2)}")]
             
         elif name == "bulk_schedule_interviews":
             response = ashby_client._make_request(
@@ -414,17 +560,30 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
                 method="POST",
                 data=arguments
             )
-            return [types.TextContent(text=f"Bulk schedule results: {json.dumps(response, indent=2)}")]
+            return [types.TextContent(type="text", text=f"Bulk schedule results: {json.dumps(response, indent=2)}")]
             
         else:
             raise ValueError(f"Unknown tool: {name}")
             
     except Exception as e:
-        return [types.TextContent(text=f"Error executing {name}: {str(e)}")]
+        logger.exception("Error executing tool %s", name)
+        return [types.TextContent(type="text", text=f"Error executing {name}: {str(e)}")]
 
 async def run():
     """Run the MCP server."""
-    await mcp.server.stdio.run_async(server)
+    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream,
+            write_stream,
+            InitializationOptions(
+                server_name="ashby-mcp",
+                server_version="0.1.0",
+                capabilities=server.get_capabilities(
+                    notification_options=NotificationOptions(),
+                    experimental_capabilities={},
+                ),
+            ),
+        )
 
 if __name__ == "__main__":
     asyncio.run(run()) 
