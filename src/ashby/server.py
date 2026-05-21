@@ -240,7 +240,133 @@ async def handle_list_tools() -> list[types.Tool]:
                 }
             }
         ),
-        
+
+        # Interview Schedule / Event Tools
+        types.Tool(
+            name="list_interview_schedules",
+            description=(
+                "List interview schedules. An interview schedule is the top-level object "
+                "that groups all scheduled interview events for a candidate's application. "
+                "Filter by applicationId or interviewStageId."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "applicationId": {"type": "string", "description": "Filter to schedules for this application"},
+                    "interviewStageId": {"type": "string", "description": "Filter to schedules at this interview stage"},
+                    "createdAfter": {"type": "integer", "description": "Return schedules created after this unix timestamp in ms"},
+                    "cursor": {"type": "string", "description": "Pagination cursor"},
+                    "syncToken": {"type": "string", "description": "Sync token for incremental updates"},
+                    "limit": {"type": "integer", "description": "Max results per page"}
+                }
+            }
+        ),
+        types.Tool(
+            name="list_interview_events",
+            description=(
+                "List the individual scheduled interview events (with start/end time and interviewers) "
+                "for a given interview schedule. Use list_interview_schedules first to find a scheduleId."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "interviewScheduleId": {"type": "string", "description": "The interview schedule to list events for"},
+                    "expand": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["interview"]},
+                        "description": "Expand related objects. Currently only 'interview' is supported."
+                    }
+                },
+                "required": ["interviewScheduleId"]
+            }
+        ),
+        types.Tool(
+            name="create_interview_schedule",
+            description="Create an interview schedule with one or more interview events for an application.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "applicationId": {"type": "string", "description": "The application this schedule is for"},
+                    "interviewEvents": {
+                        "type": "array",
+                        "description": "Events that make up this schedule",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "startTime": {"type": "string", "description": "ISO 8601 start time, e.g. 2023-01-30T15:00:00.000Z"},
+                                "endTime": {"type": "string", "description": "ISO 8601 end time"},
+                                "interviewers": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "email": {"type": "string", "description": "Ashby user email"},
+                                            "feedbackRequired": {"type": "boolean", "description": "Whether this interviewer must submit feedback"}
+                                        },
+                                        "required": ["email"]
+                                    }
+                                },
+                                "interviewId": {"type": "string", "description": "Id of the interview definition. Defaults to the org's default interview if omitted."}
+                            },
+                            "required": ["startTime", "endTime", "interviewers"]
+                        }
+                    }
+                },
+                "required": ["applicationId", "interviewEvents"]
+            }
+        ),
+        types.Tool(
+            name="update_interview_schedule",
+            description=(
+                "Update an interview schedule: either add/modify a single event, or cancel one. "
+                "Only schedules created with the same API key can be updated. "
+                "To modify an existing event, include its interviewEventId inside interviewEvent. "
+                "To cancel an event, pass interviewEventIdToCancel instead of interviewEvent."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "interviewScheduleId": {"type": "string", "description": "The schedule to update"},
+                    "interviewEvent": {
+                        "type": "object",
+                        "description": "Event to create (omit interviewEventId) or update (include interviewEventId).",
+                        "properties": {
+                            "interviewEventId": {"type": "string", "description": "Provide to update an existing event; omit to create a new one."},
+                            "startTime": {"type": "string"},
+                            "endTime": {"type": "string"},
+                            "interviewers": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "email": {"type": "string"},
+                                        "feedbackRequired": {"type": "boolean"}
+                                    },
+                                    "required": ["email"]
+                                }
+                            },
+                            "interviewId": {"type": "string"}
+                        }
+                    },
+                    "interviewEventIdToCancel": {"type": "string", "description": "Id of an event to cancel. Mutually exclusive with interviewEvent."},
+                    "allowFeedbackDeletion": {"type": "boolean", "description": "Allow canceling events that already have feedback (feedback will be deleted). Default false."}
+                },
+                "required": ["interviewScheduleId"]
+            }
+        ),
+        types.Tool(
+            name="cancel_interview_schedule",
+            description="Cancel an entire interview schedule.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The id of the interview schedule to cancel"},
+                    "allowReschedule": {"type": "boolean", "description": "Whether this schedule can be rescheduled later. Default false."}
+                },
+                "required": ["id"]
+            }
+        ),
+
         # Interview Feedback / Scorecard Tools
         types.Tool(
             name="list_feedback",
@@ -489,7 +615,47 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
                 data=arguments
             )
             return [types.TextContent(type="text", text=f"Interview list: {json.dumps(response, indent=2)}")]
-            
+
+        elif name == "list_interview_schedules":
+            response = ashby_client._make_request(
+                "/interviewSchedule.list",
+                method="POST",
+                data=arguments
+            )
+            return [types.TextContent(type="text", text=f"Interview schedules: {json.dumps(response, indent=2)}")]
+
+        elif name == "list_interview_events":
+            response = ashby_client._make_request(
+                "/interviewEvent.list",
+                method="POST",
+                data=arguments
+            )
+            return [types.TextContent(type="text", text=f"Interview events: {json.dumps(response, indent=2)}")]
+
+        elif name == "create_interview_schedule":
+            response = ashby_client._make_request(
+                "/interviewSchedule.create",
+                method="POST",
+                data=arguments
+            )
+            return [types.TextContent(type="text", text=f"Created interview schedule: {json.dumps(response, indent=2)}")]
+
+        elif name == "update_interview_schedule":
+            response = ashby_client._make_request(
+                "/interviewSchedule.update",
+                method="POST",
+                data=arguments
+            )
+            return [types.TextContent(type="text", text=f"Updated interview schedule: {json.dumps(response, indent=2)}")]
+
+        elif name == "cancel_interview_schedule":
+            response = ashby_client._make_request(
+                "/interviewSchedule.cancel",
+                method="POST",
+                data=arguments
+            )
+            return [types.TextContent(type="text", text=f"Canceled interview schedule: {json.dumps(response, indent=2)}")]
+
         elif name == "list_feedback":
             response = ashby_client._make_request(
                 "/applicationFeedback.list",
