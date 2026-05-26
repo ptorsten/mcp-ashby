@@ -434,6 +434,24 @@ async def handle_list_tools() -> list[types.Tool]:
             }
         ),
 
+        # AI Notetaker Tools
+        types.Tool(
+            name="get_notetaker_transcript",
+            description=(
+                "Fetch metadata and a signed download URL for an AI Notetaker transcript. "
+                "Requires the AI Notetaker add-on and the notetakerRead permission. "
+                "Find transcript ids via list_interview_events or list_interview_schedules. "
+                "The signed URL is short-lived — download promptly or re-call this tool."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "notetakerTranscriptId": {"type": "string", "description": "The unique id (UUID) of the notetaker transcript to fetch"}
+                },
+                "required": ["notetakerTranscriptId"]
+            }
+        ),
+
         # Candidate Notes (read-only)
         types.Tool(
             name="list_candidate_notes",
@@ -687,6 +705,14 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
                 data=arguments
             )
             return [types.TextContent(type="text", text=f"Feedback form: {json.dumps(response, indent=2)}")]
+
+        elif name == "get_notetaker_transcript":
+            response = ashby_client._make_request(
+                "/notetakerTranscript.info",
+                method="POST",
+                data=arguments
+            )
+            return [types.TextContent(type="text", text=f"Notetaker transcript: {json.dumps(response, indent=2)}")]
 
         elif name == "list_candidate_notes":
             response = ashby_client._make_request(
